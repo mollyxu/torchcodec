@@ -615,7 +615,12 @@ void SingleStreamDecoder::addAudioStream(
         *audioStreamOptions.numChannels);
   }
 
-  addStream(streamIndex, AVMEDIA_TYPE_AUDIO);
+  addStream(
+      streamIndex,
+      AVMEDIA_TYPE_AUDIO,
+      StableDevice(kStableCPU),
+      "ffmpeg",
+      audioStreamOptions.ffmpegThreadCount);
 
   auto& streamInfo = streamInfos_[activeStreamIndex_];
   streamInfo.audioStreamOptions = audioStreamOptions;
