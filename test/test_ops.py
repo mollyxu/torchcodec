@@ -17,14 +17,9 @@ import pytest
 import torch
 
 from torchcodec._core import (
-    _add_video_stream,
     _test_frame_pts_equality,
-    add_audio_stream,
-    add_video_stream,
-    create_from_bytes,
-    create_from_file,
-    create_from_file_like,
-    create_from_tensor,
+    create_streaming_encoder_to_file,
+    create_streaming_encoder_to_file_like,
     encode_audio_to_file,
     get_ffmpeg_library_versions,
     get_frame_at_index,
@@ -36,12 +31,27 @@ from torchcodec._core import (
     get_frames_in_range,
     get_json_metadata,
     get_next_frame,
+    streaming_encoder_add_frames,
+    streaming_encoder_add_video_stream,
+    streaming_encoder_close,
+)
+from torchcodec._core.ops import (
+    _add_video_stream,
+    add_audio_stream,
+    add_video_stream,
+    create_from_bytes,
+    create_from_file,
+    create_from_file_like,
+    create_from_tensor,
     seek_to_pts,
 )
+
+from torchcodec.decoders import VideoDecoder
 
 from .utils import (
     all_supported_devices,
     assert_frames_equal,
+    assert_tensor_close_on_at_least,
     get_python_version,
     NASA_AUDIO,
     NASA_AUDIO_MP3,
@@ -51,6 +61,7 @@ from .utils import (
     SINE_MONO_S32,
     SINE_MONO_S32_44100,
     SINE_MONO_S32_8000,
+    TEST_SRC_2_720P,
     unsplit_device_str,
 )
 
@@ -1138,6 +1149,195 @@ class TestAudioEncoderOps:
                 sample_rate=10,
                 filename="./file.bad_extension",
             )
+
+
+class TestMultiStreamEncoderOps:
+    @staticmethod
+    def _create_encoder(method, tmp_path, format):
+        if method == "to_file":
+            encoder_output = tmp_path / f"test.{format}"
+            return create_streaming_encoder_to_file(str(encoder_output)), encoder_output
+        elif method == "to_file_like":
+            encoder_output = io.BytesIO()
+            return (
+                create_streaming_encoder_to_file_like(format, encoder_output),
+                encoder_output,
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+    @staticmethod
+    def _get_decoder_source(encoder_output):
+        if isinstance(encoder_output, io.BytesIO):
+            return encoder_output.getvalue()
+        return str(encoder_output)
+
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    def test_double_close(self, tmp_path, method):
+        encoder_tensor, _ = self._create_encoder(method, tmp_path, "mp4")
+        streaming_encoder_close(encoder_tensor)
+        streaming_encoder_close(encoder_tensor)  # double close is a no-op
+
+    @pytest.mark.parametrize("format", ["mp4", "mov", "mkv"])
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    @pytest.mark.parametrize(
+        "device", ("cpu", pytest.param("cuda", marks=pytest.mark.needs_cuda))
+    )
+    def test_add_video_stream_and_encode_frames(self, tmp_path, format, method, device):
+        source_decoder = VideoDecoder(str(TEST_SRC_2_720P.path))
+        source_frames = source_decoder.get_frames_in_range(start=0, stop=10).data.to(
+            device
+        )
+        frame_rate = source_decoder.metadata.average_fps
+        percentage, atol = (96, 2) if device == "cuda" else (99, 2)
+
+        encoder, encoder_output = self._create_encoder(method, tmp_path, format)
+        add_video_stream_kwargs = {"frame_rate": frame_rate}
+        if device == "cpu":
+            add_video_stream_kwargs["pixel_format"] = "yuv444p"
+            add_video_stream_kwargs["crf"] = 0
+        else:
+            add_video_stream_kwargs["extra_options"] = ["qp", "1"]
+        streaming_encoder_add_video_stream(encoder, **add_video_stream_kwargs)
+        streaming_encoder_add_frames(encoder, source_frames[:5])
+        streaming_encoder_add_frames(encoder, source_frames[5:])
+        streaming_encoder_close(encoder)
+
+        decoded_frames = (
+            VideoDecoder(self._get_decoder_source(encoder_output))
+            .get_frames_in_range(start=0, stop=10)
+            .data
+        )
+        assert_tensor_close_on_at_least(
+            decoded_frames, source_frames.cpu(), percentage=percentage, atol=atol
+        )
+
+    def test_create_invalid_path(self):
+        with pytest.raises(RuntimeError, match="make sure it's a valid path"):
+            create_streaming_encoder_to_file("/nonexistent/dir/test.mp4")
+
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    def test_create_invalid_format(self, tmp_path, method):
+        if method == "to_file":
+            with pytest.raises(RuntimeError, match="check the desired extension"):
+                create_streaming_encoder_to_file(str(tmp_path / "test.bad_extension"))
+        elif method == "to_file_like":
+            with pytest.raises(
+                RuntimeError,
+                match=r"Check the desired format\? Got format=bad_extension",
+            ):
+                create_streaming_encoder_to_file_like("bad_extension", io.BytesIO())
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+    @pytest.mark.parametrize("format", ["mp4", "mov"])
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    @pytest.mark.parametrize(
+        "device", ("cpu", pytest.param("cuda", marks=pytest.mark.needs_cuda))
+    )
+    def test_fragmented_mp4(self, format, tmp_path, method, device):
+        source_decoder = VideoDecoder(str(TEST_SRC_2_720P.path))
+        source_frames = source_decoder.get_frames_in_range(start=0, stop=10).data.to(
+            device
+        )
+        frame_rate = source_decoder.metadata.average_fps
+        percentage, atol = (96, 2) if device == "cuda" else (99, 2)
+
+        encoder, encoder_output = self._create_encoder(method, tmp_path, format)
+        # In addition to the fragmentation flag, "flush_packets" and "threads"
+        # are necessary to decode frames before close().
+        # See frag flags: https://ffmpeg.org/ffmpeg-formats.html#Fragmentation
+        # TODO MultiStreamEncoder: Get a better understanding of which options
+        # are necessary for reading fragmented mp4s
+        extra_options = [
+            "movflags",
+            "+frag_every_frame+empty_moov",
+            "flush_packets",
+            "1",
+            "threads",
+            "1",
+        ]
+        if device == "cuda":
+            extra_options.extend(["qp", "1", "delay", "0"])
+            pixel_format, crf = None, None
+        else:
+            extra_options.extend(["tune", "zerolatency"])
+            pixel_format, crf = "yuv444p", 0
+        streaming_encoder_add_video_stream(
+            encoder,
+            frame_rate=frame_rate,
+            pixel_format=pixel_format,
+            crf=crf,
+            extra_options=extra_options,
+        )
+        # Here, we decode the available fragmented mp4 frames before calling close()
+        for batch in [source_frames[:5], source_frames[5:]]:
+            streaming_encoder_add_frames(encoder, batch)
+            mid_decoder = VideoDecoder(self._get_decoder_source(encoder_output))
+            num_available = len(mid_decoder)
+            assert num_available > 0
+            assert_tensor_close_on_at_least(
+                mid_decoder.get_frames_in_range(start=0, stop=num_available).data,
+                source_frames[:num_available].cpu(),
+                percentage=percentage,
+                atol=atol,
+            )
+
+        streaming_encoder_close(encoder)
+        # After close, all frames must be decodable
+        assert_tensor_close_on_at_least(
+            VideoDecoder(self._get_decoder_source(encoder_output))
+            .get_frames_in_range(start=0, stop=10)
+            .data,
+            source_frames.cpu(),
+            percentage=percentage,
+            atol=atol,
+        )
+
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    def test_add_video_stream_twice_errors(self, tmp_path, method):
+        encoder, _ = self._create_encoder(method, tmp_path, "mp4")
+        streaming_encoder_add_video_stream(encoder, frame_rate=30.0)
+        with pytest.raises(RuntimeError, match="already been added"):
+            streaming_encoder_add_video_stream(encoder, frame_rate=24.0)
+
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    @pytest.mark.parametrize(
+        "device", ("cpu", pytest.param("cuda", marks=pytest.mark.needs_cuda))
+    )
+    def test_add_frames_different_sizes_errors(self, tmp_path, method, device):
+        encoder, _ = self._create_encoder(method, tmp_path, "mp4")
+        streaming_encoder_add_video_stream(encoder, frame_rate=30.0)
+        frames_256 = torch.randint(0, 256, (2, 3, 256, 256), dtype=torch.uint8).to(
+            device
+        )
+        frames_512 = torch.randint(0, 256, (2, 3, 512, 512), dtype=torch.uint8).to(
+            device
+        )
+        streaming_encoder_add_frames(encoder, frames_256)
+        with pytest.raises(RuntimeError, match="same dimensions"):
+            streaming_encoder_add_frames(encoder, frames_512)
+
+    @pytest.mark.needs_cuda
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    def test_add_frames_different_devices_errors(self, tmp_path, method):
+        encoder, _ = self._create_encoder(method, tmp_path, "mp4")
+        streaming_encoder_add_video_stream(encoder, frame_rate=30.0)
+        cpu_frames = torch.randint(0, 256, (2, 3, 64, 64), dtype=torch.uint8)
+        cuda_frames = cpu_frames.to("cuda")
+        streaming_encoder_add_frames(encoder, cpu_frames)
+        with pytest.raises(RuntimeError, match="same device"):
+            streaming_encoder_add_frames(encoder, cuda_frames)
+
+    @pytest.mark.parametrize("method", ("to_file", "to_file_like"))
+    @pytest.mark.parametrize(
+        "device", ("cpu", pytest.param("cuda", marks=pytest.mark.needs_cuda))
+    )
+    def test_add_frames_without_stream_errors(self, tmp_path, method, device):
+        encoder, _ = self._create_encoder(method, tmp_path, "mp4")
+        frames = torch.randint(0, 256, (5, 3, 64, 64), dtype=torch.uint8).to(device)
+        with pytest.raises(RuntimeError, match="No video stream"):
+            streaming_encoder_add_frames(encoder, frames)
 
 
 if __name__ == "__main__":

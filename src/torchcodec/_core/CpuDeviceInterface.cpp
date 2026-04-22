@@ -6,22 +6,9 @@
 
 #include "CpuDeviceInterface.h"
 
-extern "C" {
-#include <libavutil/pixdesc.h>
-}
-
 namespace facebook::torchcodec {
 
 namespace {
-
-// Returns the bit depth per channel for the given pixel format.
-int getBitDepthFromAVPixelFormat(AVPixelFormat format) {
-  const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
-  if (desc && desc->nb_components > 0) {
-    return desc->comp[0].depth;
-  }
-  return 8;
-}
 
 // Returns the appropriate RGB output format based on source bit depth.
 // RGB24 is 8 bits per channel, RGB48 is 16 bits per channel. For >8-bit
@@ -56,7 +43,8 @@ CpuDeviceInterface::CpuDeviceInterface(const StableDevice& device)
 void CpuDeviceInterface::initialize(
     const AVStream* avStream,
     [[maybe_unused]] const UniqueDecodingAVFormatContext& avFormatCtx,
-    const SharedAVCodecContext& codecContext) {
+    const SharedAVCodecContext& codecContext,
+    [[maybe_unused]] OutputDtype outputDtype) {
   STD_TORCH_CHECK(avStream != nullptr, "avStream is null");
   codecContext_ = codecContext;
   timeBase_ = avStream->time_base;
@@ -127,11 +115,15 @@ void CpuDeviceInterface::initializeVideo(
     // default, it will insert it after the user filters. We need an explicit
     // format conversion to get the behavior we want.
     //
-    // We store the user transforms without the format prefix here. The format
-    // prefix is added dynamically in convertVideoAVFrameToFrameOutput()
-    // based on the source bit depth.
-    userTransformFilters_ = filters.str();
-    filters_ = userTransformFilters_;
+    // Build the final filters_ string with the format prefix based on the
+    // resolved output bit depth. The format prefix ensures user transforms
+    // run in the correct output color space (RGB24 or RGB48).
+    int sourceBitDepth = getBitDepthFromAVPixelFormat(
+        static_cast<AVPixelFormat>(codecContext_->pix_fmt));
+    int bitDepth =
+        resolvedBitDepth(sourceBitDepth, videoStreamOptions.outputDtype);
+    AVPixelFormat outputPixelFormat = getOutputPixelFormat(bitDepth);
+    filters_ = getFormatFilterString(outputPixelFormat) + filters.str();
   }
 
   initialized_ = true;
@@ -216,23 +208,13 @@ void CpuDeviceInterface::convertVideoAVFrameToFrameOutput(
   // can still work in such situations, so they should.
   auto inputDims = FrameDims(avFrame->height, avFrame->width);
   auto avFrameFormat = static_cast<AVPixelFormat>(avFrame->format);
-  int bitDepth = getBitDepthFromAVPixelFormat(avFrameFormat);
-  // Apply user override if set.
-  if (videoStreamOptions_.outputBitDepth > 0) {
-    bitDepth = (videoStreamOptions_.outputBitDepth > 8) ? 10 : 8;
-  }
+  int sourceBitDepth = getBitDepthFromAVPixelFormat(avFrameFormat);
+  int bitDepth =
+      resolvedBitDepth(sourceBitDepth, videoStreamOptions_.outputDtype);
   AVPixelFormat outputPixelFormat = getOutputPixelFormat(bitDepth);
 
-  auto outputDims = resizedOutputDims_.value_or(
-      FrameDims(avFrame->height, avFrame->width, bitDepth));
-  // Ensure bitDepth is set on outputDims even when using resizedOutputDims_
-  outputDims.bitDepth = bitDepth;
-
-  // Update the filters_ string dynamically based on bit depth, so that
-  // user transforms run in the correct output color space.
-  if (!userTransformFilters_.empty()) {
-    filters_ = getFormatFilterString(outputPixelFormat) + userTransformFilters_;
-  }
+  auto outputDims =
+      resizedOutputDims_.value_or(FrameDims(avFrame->height, avFrame->width));
 
   if (preAllocatedOutputTensor.has_value()) {
     auto shape = preAllocatedOutputTensor.value().sizes();
@@ -253,7 +235,7 @@ void CpuDeviceInterface::convertVideoAVFrameToFrameOutput(
 
   if (colorConversionLibrary == ColorConversionLibrary::SWSCALE) {
     outputTensor = preAllocatedOutputTensor.value_or(
-        allocateEmptyHWCTensor(outputDims, kStableCPU));
+        allocateEmptyHWCTensor(outputDims, kStableCPU, bitDepth));
 
     SwsConfig swsConfig(
         avFrame->width,
@@ -283,7 +265,8 @@ void CpuDeviceInterface::convertVideoAVFrameToFrameOutput(
 
     frameOutput.data = outputTensor;
   } else if (colorConversionLibrary == ColorConversionLibrary::FILTERGRAPH) {
-    outputTensor = convertAVFrameToTensorUsingFilterGraph(avFrame, outputDims);
+    outputTensor =
+        convertAVFrameToTensorUsingFilterGraph(avFrame, outputDims, bitDepth);
 
     // Similarly to above, if this check fails it means the frame wasn't
     // reshaped to its expected dimensions by filtergraph.
@@ -317,9 +300,10 @@ void CpuDeviceInterface::convertVideoAVFrameToFrameOutput(
 torch::stable::Tensor
 CpuDeviceInterface::convertAVFrameToTensorUsingFilterGraph(
     const UniqueAVFrame& avFrame,
-    const FrameDims& outputDims) {
+    const FrameDims& outputDims,
+    int bitDepth) {
   auto avFrameFormat = static_cast<AVPixelFormat>(avFrame->format);
-  AVPixelFormat outputFormat = getOutputPixelFormat(outputDims.bitDepth);
+  AVPixelFormat outputFormat = getOutputPixelFormat(bitDepth);
 
   FiltersConfig filtersConfig(
       avFrame->width,

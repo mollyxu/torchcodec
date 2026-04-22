@@ -21,6 +21,27 @@ enum ColorConversionLibrary {
   SWSCALE
 };
 
+// Controls the dtype of decoded frame tensors.
+// UINT8: Always output uint8 tensors (default, backward compatible).
+// FLOAT32: Always output float32 tensors normalized to [0, 1].
+// AUTO: Output uint8 for SDR (<=8-bit) sources, float32 for HDR (>8-bit).
+enum class OutputDtype { UINT8, FLOAT32, AUTO };
+
+// Returns the effective output bit depth given the source bit depth and the
+// user's OutputDtype setting.
+// UINT8: always 8. FLOAT32: preserve source. AUTO: 8 for <=8-bit, else source.
+inline int resolvedBitDepth(int sourceBitDepth, OutputDtype outputDtype) {
+  switch (outputDtype) {
+    case OutputDtype::UINT8:
+      return 8;
+    case OutputDtype::FLOAT32:
+      return sourceBitDepth;
+    case OutputDtype::AUTO:
+      return (sourceBitDepth <= 8) ? 8 : sourceBitDepth;
+  }
+  return 8;
+}
+
 struct VideoStreamOptions {
   VideoStreamOptions() {}
 
@@ -47,10 +68,8 @@ struct VideoStreamOptions {
   // Device variant (e.g., "ffmpeg", "beta", etc.)
   std::string_view deviceVariant = "ffmpeg";
 
-  // 0 = auto (default): detect from source bit depth.
-  // 8 = force uint8 output (RGB24).
-  // 16 = force uint16 output (RGB48).
-  int outputBitDepth = 0;
+  // Controls the dtype of decoded frame tensors.
+  OutputDtype outputDtype = OutputDtype::UINT8;
 
   // Encoding options
   std::optional<std::string> codec;

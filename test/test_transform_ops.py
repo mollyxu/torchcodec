@@ -5,25 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-
 import json
 import os
 import subprocess
 
 import pytest
-
 import torch
 import torchcodec
-
-from torchcodec._core import (
-    _add_video_stream,
-    add_video_stream,
-    create_from_file,
-    get_frame_at_index,
-    get_json_metadata,
-)
+from torchcodec._core import get_frame_at_index, get_json_metadata
+from torchcodec._core.ops import _add_video_stream, add_video_stream, create_from_file
 from torchcodec.decoders import VideoDecoder
-
 from torchvision.transforms import v2
 
 from .utils import (
@@ -32,7 +23,6 @@ from .utils import (
     AV1_VIDEO,
     get_ffmpeg_minor_version,
     H265_VIDEO,
-    IS_WINDOWS,
     NASA_VIDEO,
     NASA_VIDEO_HDR,
     needs_cuda,
@@ -72,22 +62,29 @@ class TestPublicVideoDecoderTransformOps:
             ),
         ],
     )
+    @pytest.mark.parametrize("output_dtype", [None, torch.float32])
     def test_resize_torchvision(
-        self, video, height_scaling_factor, width_scaling_factor
+        self, video, output_dtype, height_scaling_factor, width_scaling_factor
     ):
         height = int(video.get_height() * height_scaling_factor)
         width = int(video.get_width() * width_scaling_factor)
 
+        dtype_kwargs = dict(output_dtype=output_dtype) if output_dtype else {}
+
         # We're using both the TorchCodec object and the TorchVision object to
         # ensure that they specify exactly the same thing.
         decoder_resize = VideoDecoder(
-            video.path, transforms=[torchcodec.transforms.Resize(size=(height, width))]
+            video.path,
+            transforms=[torchcodec.transforms.Resize(size=(height, width))],
+            **dtype_kwargs,
         )
         decoder_resize_tv = VideoDecoder(
-            video.path, transforms=[v2.Resize(size=(height, width))]
+            video.path,
+            transforms=[v2.Resize(size=(height, width))],
+            **dtype_kwargs,
         )
 
-        decoder_full = VideoDecoder(video.path)
+        decoder_full = VideoDecoder(video.path, **dtype_kwargs)
 
         num_frames = len(decoder_resize)
         assert num_frames == len(decoder_full)
@@ -119,40 +116,67 @@ class TestPublicVideoDecoderTransformOps:
             assert frame_tv.shape == expected_shape
             assert frame_tv_no_antialias.shape == expected_shape
 
-            # Scale tolerances for uint16 (10-bit HDR) vs uint8.
-            # uint16 values span 0-65535 vs 0-255, so absolute tolerances
-            # scale by 256. The percentage and max tolerances are slightly
-            # more relaxed for uint16 because at higher precision,
-            # sub-pixel interpolation differences between FFmpeg's and
-            # torchvision's bilinear resize (particularly at frame
-            # boundaries) are no longer masked by 8-bit quantization. For
-            # example, a boundary pixel diff that rounds to 4/255 at uint8
-            # may resolve to ~1963/65535 (~7.7 in uint8-equivalent) at
-            # uint16 because the rounding no longer absorbs the
-            # disagreement in edge padding between the two implementations.
-            if frame_resize.dtype == torch.uint16:
+            is_hdr = video in (NASA_VIDEO_HDR, TEST_SRC_2_720P_HDR)
+
+            if output_dtype == torch.float32 and is_hdr:
+                # float32 HDR: compare in uint16 space for cleaner tolerances.
+                # atol=256 in uint16 space ≈ atol=1 in uint8 space.
                 close_pct, close_atol, max_atol = 99.5, 256, 12 * 256
+                frame_resize_cmp = (frame_resize * 65535).round().to(torch.int32)
+                frame_tv_cmp = (frame_tv * 65535).round().to(torch.int32)
+                frame_tv_no_antialias_cmp = (
+                    (frame_tv_no_antialias * 65535).round().to(torch.int32)
+                )
+            elif output_dtype == torch.float32:
+                # float32 SDR: compare in uint8 space.
+                close_pct, close_atol, max_atol = 99.8, 1, 6
+                frame_resize_cmp = (frame_resize * 255).round().to(torch.int32)
+                frame_tv_cmp = (frame_tv * 255).round().to(torch.int32)
+                frame_tv_no_antialias_cmp = (
+                    (frame_tv_no_antialias * 255).round().to(torch.int32)
+                )
+            elif is_hdr:
+                # 10-bit HDR content decoded to uint8 has slightly larger
+                # swscale vs torchvision resize diffs than native 8-bit
+                # content due to the 10->8 bit quantization in swscale
+                close_pct, close_atol, max_atol = 99.8, 1, 10
+                frame_resize_cmp = frame_resize
+                frame_tv_cmp = frame_tv
+                frame_tv_no_antialias_cmp = frame_tv_no_antialias
             else:
                 close_pct, close_atol, max_atol = 99.8, 1, 6
+                frame_resize_cmp = frame_resize
+                frame_tv_cmp = frame_tv
+                frame_tv_no_antialias_cmp = frame_tv_no_antialias
 
             assert_tensor_close_on_at_least(
-                frame_resize, frame_tv, percentage=close_pct, atol=close_atol
+                frame_resize_cmp, frame_tv_cmp, percentage=close_pct, atol=close_atol
             )
-            torch.testing.assert_close(frame_resize, frame_tv, rtol=0, atol=max_atol)
+            torch.testing.assert_close(
+                frame_resize_cmp, frame_tv_cmp, rtol=0, atol=max_atol
+            )
 
             if height_scaling_factor < 1 or width_scaling_factor < 1:
                 # Antialias only relevant when down-scaling!
-                with pytest.raises(AssertionError, match="Expected at least"):
-                    assert_tensor_close_on_at_least(
-                        frame_resize,
-                        frame_tv_no_antialias,
-                        percentage=99,
-                        atol=close_atol,
-                    )
-                with pytest.raises(AssertionError, match="Tensor-likes are not close"):
-                    torch.testing.assert_close(
-                        frame_resize, frame_tv_no_antialias, rtol=0, atol=max_atol
-                    )
+                # For HDR content with mild downscale factors, the
+                # antialias difference may be too small to detect.
+                if not is_hdr:
+                    with pytest.raises(AssertionError, match="Expected at least"):
+                        assert_tensor_close_on_at_least(
+                            frame_resize_cmp,
+                            frame_tv_no_antialias_cmp,
+                            percentage=99,
+                            atol=close_atol,
+                        )
+                    with pytest.raises(
+                        AssertionError, match="Tensor-likes are not close"
+                    ):
+                        torch.testing.assert_close(
+                            frame_resize_cmp,
+                            frame_tv_no_antialias_cmp,
+                            rtol=0,
+                            atol=max_atol,
+                        )
 
     def test_resize_fails(self):
         with pytest.raises(
@@ -237,24 +261,31 @@ class TestPublicVideoDecoderTransformOps:
             ),
         ],
     )
+    @pytest.mark.parametrize("output_dtype", [None, torch.float32])
     def test_center_crop_torchvision(
         self,
         height_scaling_factor,
         width_scaling_factor,
         video,
+        output_dtype,
     ):
         height = int(video.get_height() * height_scaling_factor)
         width = int(video.get_width() * width_scaling_factor)
 
+        dtype_kwargs = dict(output_dtype=output_dtype) if output_dtype else {}
+
         tc_center_crop = torchcodec.transforms.CenterCrop(size=(height, width))
-        decoder_center_crop = VideoDecoder(video.path, transforms=[tc_center_crop])
+        decoder_center_crop = VideoDecoder(
+            video.path, transforms=[tc_center_crop], **dtype_kwargs
+        )
 
         decoder_center_crop_tv = VideoDecoder(
             video.path,
             transforms=[v2.CenterCrop(size=(height, width))],
+            **dtype_kwargs,
         )
 
-        decoder_full = VideoDecoder(video.path)
+        decoder_full = VideoDecoder(video.path, **dtype_kwargs)
 
         num_frames = len(decoder_center_crop_tv)
         assert num_frames == len(decoder_full)
@@ -317,15 +348,19 @@ class TestPublicVideoDecoderTransformOps:
         ],
     )
     @pytest.mark.parametrize("seed", [0, 1234])
+    @pytest.mark.parametrize("output_dtype", [None, torch.float32])
     def test_random_crop_torchvision(
         self,
         height_scaling_factor,
         width_scaling_factor,
         video,
         seed,
+        output_dtype,
     ):
         height = int(video.get_height() * height_scaling_factor)
         width = int(video.get_width() * width_scaling_factor)
+
+        dtype_kwargs = dict(output_dtype=output_dtype) if output_dtype else {}
 
         # We want both kinds of RandomCrop objects to get arrive at the same
         # locations to crop, so we need to make sure they get the same random
@@ -333,7 +368,9 @@ class TestPublicVideoDecoderTransformOps:
         # by the VideoDecoder.
         torch.manual_seed(seed)
         tc_random_crop = torchcodec.transforms.RandomCrop(size=(height, width))
-        decoder_random_crop = VideoDecoder(video.path, transforms=[tc_random_crop])
+        decoder_random_crop = VideoDecoder(
+            video.path, transforms=[tc_random_crop], **dtype_kwargs
+        )
 
         # Resetting manual seed for when TorchCodec's RandomCrop, created from
         # the TorchVision RandomCrop, is used inside of the VideoDecoder. It
@@ -342,9 +379,10 @@ class TestPublicVideoDecoderTransformOps:
         decoder_random_crop_tv = VideoDecoder(
             video.path,
             transforms=[v2.RandomCrop(size=(height, width))],
+            **dtype_kwargs,
         )
 
-        decoder_full = VideoDecoder(video.path)
+        decoder_full = VideoDecoder(video.path, **dtype_kwargs)
 
         num_frames = len(decoder_random_crop_tv)
         assert num_frames == len(decoder_full)
@@ -455,7 +493,9 @@ class TestPublicVideoDecoderTransformOps:
     @pytest.mark.parametrize(
         "video", [TEST_SRC_2_720P, NASA_VIDEO_HDR, TEST_SRC_2_720P_HDR]
     )
-    def test_transform_pipeline(self, resize, random_crop, video):
+    @pytest.mark.parametrize("output_dtype", [None, torch.float32])
+    def test_transform_pipeline(self, resize, random_crop, video, output_dtype):
+        dtype_kwargs = dict(output_dtype=output_dtype) if output_dtype else {}
         decoder = VideoDecoder(
             video.path,
             transforms=[
@@ -464,6 +504,7 @@ class TestPublicVideoDecoderTransformOps:
                 # crop to smaller than the resize, but still bigger than original
                 random_crop(size=(1080, 1920)),
             ],
+            **dtype_kwargs,
         )
 
         num_frames = len(decoder)
@@ -501,23 +542,6 @@ class TestCoreVideoDecoderTransformOps:
             NASA_VIDEO,
             H265_VIDEO,
             AV1_VIDEO,
-            # TODO: On Windows + FFmpeg 4, filtergraph and swscale produce
-            # fundamentally different results for 10-bit HDR (BT.2020 +
-            # SMPTE2084) content. The root cause is unknown.
-            pytest.param(
-                NASA_VIDEO_HDR,
-                marks=pytest.mark.skipif(
-                    IS_WINDOWS and torchcodec.ffmpeg_major_version < 5,
-                    reason="10-bit HDR color conversion differs on Windows + FFmpeg 4",
-                ),
-            ),
-            pytest.param(
-                TEST_SRC_2_720P_HDR,
-                marks=pytest.mark.skipif(
-                    IS_WINDOWS and torchcodec.ffmpeg_major_version < 5,
-                    reason="10-bit HDR color conversion differs on Windows + FFmpeg 4",
-                ),
-            ),
         ],
     )
     def test_color_conversion_library(self, video):
