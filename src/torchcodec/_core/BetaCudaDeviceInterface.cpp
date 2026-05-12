@@ -13,6 +13,7 @@
 
 #include "DeviceInterface.h"
 #include "FFMPEGCommon.h"
+#include "Logging.h"
 #include "NVDECCache.h"
 
 #include "NVCUVIDRuntimeLoader.h"
@@ -305,14 +306,18 @@ void BetaCudaDeviceInterface::initialize(
   STD_TORCH_CHECK(avStream != nullptr, "AVStream cannot be null");
   rotation_ = rotationFromDegrees(getRotationFromStream(avStream));
   if (!nvcuvidAvailable_ || !nativeNVDECSupport(device_, codecContext)) {
+    if (!nvcuvidAvailable_) {
+      TC_LOG("NVCUVID library not available; falling back to CPU decoding.");
+    } else {
+      TC_LOG(
+          "Video stream not supported by NVDEC; falling back to CPU decoding.");
+    }
     cpuFallback_ = createDeviceInterface(kStableCPU);
     STD_TORCH_CHECK(
         cpuFallback_ != nullptr, "Failed to create CPU device interface");
     cpuFallback_->initialize(avStream, avFormatCtx, codecContext);
     cpuFallback_->initializeVideo(
-        VideoStreamOptions(),
-        {},
-        /*resizedOutputDims=*/std::nullopt);
+        VideoStreamOptions(), {}, /*resizedOutputDims=*/std::nullopt);
     // We'll always use the CPU fallback from now on, so we can return early.
     return;
   }
@@ -743,19 +748,24 @@ UniqueAVFrame BetaCudaDeviceInterface::transferCpuFrameToGpuNV12(
   //   using sws_scale.
   // - Then we allocate GPU memory and copy the NV12 CPU frame to the GPU. This
   //   is what we return
+  // Since NV12 requires even dimensions, the returned NV12 frame will have even
+  // (rounded up) width and height, even if the original CPU frame had odd
+  // dimensions.
 
   STD_TORCH_CHECK(cpuFrame != nullptr, "CPU frame cannot be null");
 
   int width = cpuFrame->width;
   int height = cpuFrame->height;
+  int evenWidth = roundUpToEven(width);
+  int evenHeight = roundUpToEven(height);
 
   // intermediate NV12 CPU frame. It's not on the GPU yet.
   UniqueAVFrame nv12CpuFrame(av_frame_alloc());
   STD_TORCH_CHECK(nv12CpuFrame != nullptr, "Failed to allocate NV12 CPU frame");
 
   nv12CpuFrame->format = AV_PIX_FMT_NV12;
-  nv12CpuFrame->width = width;
-  nv12CpuFrame->height = height;
+  nv12CpuFrame->width = evenWidth;
+  nv12CpuFrame->height = evenHeight;
 
   int ret = av_frame_get_buffer(nv12CpuFrame.get(), 0);
   STD_TORCH_CHECK(
@@ -768,11 +778,12 @@ UniqueAVFrame BetaCudaDeviceInterface::transferCpuFrameToGpuNV12(
       height,
       static_cast<AVPixelFormat>(cpuFrame->format),
       cpuFrame->colorspace,
-      width,
-      height);
+      evenWidth,
+      evenHeight,
+      AV_PIX_FMT_NV12);
 
   if (!swsContext_ || prevSwsConfig_ != swsConfig) {
-    swsContext_ = createSwsContext(swsConfig, AV_PIX_FMT_NV12, SWS_BILINEAR);
+    swsContext_ = createSwsContext(swsConfig, SWS_BILINEAR);
     prevSwsConfig_ = swsConfig;
   }
 
@@ -785,12 +796,10 @@ UniqueAVFrame BetaCudaDeviceInterface::transferCpuFrameToGpuNV12(
       nv12CpuFrame->data,
       nv12CpuFrame->linesize);
   STD_TORCH_CHECK(
-      convertedHeight == height, "sws_scale failed for CPU->NV12 conversion");
+      convertedHeight == evenHeight,
+      "sws_scale failed for CPU->NV12 conversion");
 
-  int ySize = width * height;
-  STD_TORCH_CHECK(
-      ySize % 2 == 0,
-      "Y plane size must be even. Please report on TorchCodec repo.");
+  int ySize = evenWidth * evenHeight;
   int uvSize = ySize / 2; // NV12: UV plane is half the size of Y plane
   size_t totalSize = static_cast<size_t>(ySize + uvSize);
 
@@ -806,12 +815,12 @@ UniqueAVFrame BetaCudaDeviceInterface::transferCpuFrameToGpuNV12(
   STD_TORCH_CHECK(gpuFrame != nullptr, "Failed to allocate GPU AVFrame");
 
   gpuFrame->format = AV_PIX_FMT_CUDA;
-  gpuFrame->width = width;
-  gpuFrame->height = height;
+  gpuFrame->width = evenWidth;
+  gpuFrame->height = evenHeight;
   gpuFrame->data[0] = cudaBuffer;
   gpuFrame->data[1] = cudaBuffer + ySize;
-  gpuFrame->linesize[0] = width;
-  gpuFrame->linesize[1] = width;
+  gpuFrame->linesize[0] = evenWidth;
+  gpuFrame->linesize[1] = evenWidth;
 
   // Note that we use cudaMemcpy2D here instead of cudaMemcpy because the
   // linesizes (strides) may be different than the widths for the input CPU
@@ -821,24 +830,21 @@ UniqueAVFrame BetaCudaDeviceInterface::transferCpuFrameToGpuNV12(
       gpuFrame->linesize[0],
       nv12CpuFrame->data[0],
       nv12CpuFrame->linesize[0],
-      width,
-      height,
+      evenWidth,
+      evenHeight,
       cudaMemcpyHostToDevice);
   STD_TORCH_CHECK(
       err == cudaSuccess,
       "Failed to copy Y plane to GPU: ",
       cudaGetErrorString(err));
 
-  STD_TORCH_CHECK(
-      height % 2 == 0,
-      "height must be even. Please report on TorchCodec repo.");
   err = cudaMemcpy2D(
       gpuFrame->data[1],
       gpuFrame->linesize[1],
       nv12CpuFrame->data[1],
       nv12CpuFrame->linesize[1],
-      width,
-      height / 2,
+      evenWidth,
+      evenHeight / 2,
       cudaMemcpyHostToDevice);
   STD_TORCH_CHECK(
       err == cudaSuccess,
@@ -874,6 +880,10 @@ void BetaCudaDeviceInterface::convertAVFrameToFrameOutput(
     UniqueAVFrame& avFrame,
     FrameOutput& frameOutput,
     std::optional<torch::stable::Tensor> preAllocatedOutputTensor) {
+  // Capture original dimensions before transferCpuFrameToGpuNV12 may
+  // round them up to even for NV12.
+  FrameDims originalDims(avFrame->height, avFrame->width);
+
   UniqueAVFrame gpuFrame =
       cpuFallback_ ? transferCpuFrameToGpuNV12(avFrame) : std::move(avFrame);
 
@@ -886,9 +896,14 @@ void BetaCudaDeviceInterface::convertAVFrameToFrameOutput(
   cudaStream_t nvdecStream = getCurrentCudaStream(device_.index());
 
   if (rotation_ == Rotation::NONE) {
-    validatePreAllocatedTensorShape(preAllocatedOutputTensor, gpuFrame);
+    validatePreAllocatedTensorShape(preAllocatedOutputTensor, originalDims);
     frameOutput.data = convertNV12FrameToRGB(
-        gpuFrame, device_, nppCtx_, nvdecStream, preAllocatedOutputTensor);
+        gpuFrame,
+        device_,
+        nppCtx_,
+        nvdecStream,
+        preAllocatedOutputTensor,
+        originalDims);
   } else {
     // preAllocatedOutputTensor has post-rotation dimensions, but NV12->RGB
     // conversion outputs pre-rotation dimensions, so we can't use it as the
@@ -900,7 +915,8 @@ void BetaCudaDeviceInterface::convertAVFrameToFrameOutput(
         device_,
         nppCtx_,
         nvdecStream,
-        /*preAllocatedOutputTensor=*/std::nullopt);
+        /*preAllocatedOutputTensor=*/std::nullopt,
+        originalDims);
     applyRotation(frameOutput, preAllocatedOutputTensor);
   }
 }
